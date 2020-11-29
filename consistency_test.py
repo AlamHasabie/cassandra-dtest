@@ -861,14 +861,14 @@ class TestConsistency(Tester):
                 ack_event = TestConsistency.ManagerFor14515.Handler.ack_event
                 if event.event_type == watchdog.events.EVENT_TYPE_MOVED :
                     logger.debug("Captured event {}".format(event))
-                    if manager.stillObserving() :
-                        manager.decrementFileCounter()
-                        if manager.should_inject_compaction() :
-                            manager.inject_compaction()
-                        else :
-                            if time.time() >= manager.compaction_window_start:
-                                logger.error("Found non-injecting read after compaction window start, wait for timeout...")
-                                return
+                    # if manager.stillObserving() :
+                    #     manager.decrementFileCounter()
+                    #     if manager.should_inject_compaction() :
+                    #         manager.inject_compaction()
+                    #     else :
+                    #         if time.time() >= manager.compaction_window_start:
+                    #             logger.error("Found non-injecting read after compaction window start, wait for timeout...")
+                    #            return
 
                     ack_event(event)
                  
@@ -891,31 +891,43 @@ class TestConsistency(Tester):
 
         cluster.populate(2).start()
         node1, node2 = cluster.nodelist()
-        logger.debug(node1)
 
         manager = TestConsistency.ManagerFor14515([node1, node2])
         manager.start_service()
-        session = self.patient_cql_connection(node2)
+        session = self.patient_cql_connection(node1)
 
         query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
         session.execute(query)
 
-        manager.gc_grace_seconds = 25
-        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck)) WITH gc_grace_seconds=25";
+        manager.gc_grace_seconds = 60
+        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck))";
         session.execute(query)
 
-        manager.open_compaction_window()
-        result = session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0;')
-        manager.close_compaction_window()
-
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 1;')
+        # With both nodes up, insert three data
+        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 0;')
         session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 1;')
 
+        # With node 2 down, insert tombstone deletion on node 1
+        # node 1 : RT-[@0 , 0@0, 1@1, RT-]@0
+        # node 2 : 0@0, 1@1
+        node2.stop(wait_other_notice=True)
+        session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0 AND ck <= 2;')
+        node2.start(wait_for_binary_proto=True)
+
+        # With node 1 down, insert deletion on node 2
+        # and probably insert 3@0
+        # Maybe : insert data 2 on node 2,
+        # node 1 : RT-[@0 , 1@1, 1@0, RT-]@0
+        # node 2 : 0@0, X
+
+        session = self.patient_cql_connection(node2)
         node1.stop(wait_other_notice=True)
-        session.execute('DELETE FROM test.test USING TIMESTAMP 1 WHERE pk = 0 AND ck = 0;')
+        session.execute('DELETE FROM test.test USING TIMESTAMP 1 WHERE pk = 0 AND ck = 1;')
         node1.start(wait_for_binary_proto=True)
 
-        # Bug trigger
+        # If we still have the bound end, then we will be able to return 2
+        # However, if the bound ends , then 2 will be a part of the bound,
+        # thus it should not be returned post-compaction
         assert_all(session,
                    'SELECT ck FROM test.test WHERE pk = 0 LIMIT 1;',
                    [[1]],
