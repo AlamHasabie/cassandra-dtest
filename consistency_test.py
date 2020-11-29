@@ -1,8 +1,10 @@
 import queue
 import sys
+import shutil
 import threading
 import time
 import pytest
+import os
 import logging
 from collections import OrderedDict, namedtuple
 from copy import deepcopy
@@ -15,6 +17,11 @@ from tools.assertions import (assert_all, assert_length_equal, assert_none,
 from dtest import MultiError, Tester, create_ks, create_cf
 from tools.data import (create_c1c2_table, insert_c1c2, insert_columns,
                         query_c1c2, rows_to_list)
+from tools.jmxutils import JolokiaAgent, make_mbean
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import watchdog
 
 since = pytest.mark.since
 ported_to_in_jvm = pytest.mark.ported_to_in_jvm
@@ -767,820 +774,968 @@ class TestAccuracy(TestHelper):
 
 class TestConsistency(Tester):
 
-    @since('3.0')
-    def test_14513_transient(self):
-        """
-        @jira_ticket CASSANDRA-14513
+    """
+    A wrapper class to define testing behavior
+    In 14515's case, it allows for IPC dir file watching
+    Also , it will do compaction in one of the nodes
+    So we need to get the reference for the nodes
 
-        A reproduction / regression test to illustrate CASSANDRA-14513:
-        transient data loss when doing reverse-order queries with range
-        tombstones in place.
+    Since read is blocking, we need to have a watcher thread running
+    """
+    class ManagerFor14515 :
 
-        This test shows how the bug can cause queries to return invalid
-        results by just a single node.
-        """
-        cluster = self.cluster
+        def __init__(self, cluster, new_dir="/home/alam/cass-ipc/new", ack_dir="/home/alam/cass-ipc/ack") :
+            self.__cluster = cluster
+            self.__new_dir = new_dir
+            self.__ack_dir = ack_dir
+            self.gc_grace_seconds = 0
+            self.__n_file_before_workload = 4
 
-        # set column_index_size_in_kb to 1 for a slightly easier reproduction sequence
-        cluster.set_configuration_options(values={'column_index_size_in_kb': 1})
+        def start_service(self) :
 
-        cluster.populate(1).start()
-        node1 = cluster.nodelist()[0]
+            self.__observer = Observer()
+            handler = TestConsistency.ManagerFor14515.Handler()
+            TestConsistency.ManagerFor14515.Handler.handler_manager = self
 
-        session = self.patient_cql_connection(node1)
+            # Flat watch
+            self.__observer.schedule(handler, self.__new_dir, recursive=False)
+            logger.info("Start watcher service on {}".format(self.__new_dir))
+            self.__observer.start()
 
-        query = "CREATE KEYSPACE journals WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 1};"
-        session.execute(query)
+            self.__observing = True
+        
 
-        query = 'CREATE TABLE journals.logs (user text, year int, month int, day int, title text, body text, PRIMARY KEY ((user), year, month, day, title));';
-        session.execute(query)
+        def should_inject_compaction(self) :
+            return self.__n_file_before_workload == 0
 
-        # populate the table
-        stmt = session.prepare('INSERT INTO journals.logs (user, year, month, day, title, body) VALUES (?, ?, ?, ?, ?, ?);');
-        for year in range(2011, 2018):
-            for month in range(1, 13):
-                for day in range(1, 31):
-                    session.execute(stmt, ['beobal', year, month, day, 'title', 'Lorem ipsum dolor sit amet'], ConsistencyLevel.ONE)
-        node1.flush()
+        # Instead of injecting compaction, it turns out 
+        # we can just wait for the data to pass its gc_grace
+        def inject_compaction(self, node_id=0) :
+            node = self.__cluster[node_id]
 
-        # make sure the data is there
-        assert_all(session,
-                   "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
-                   [[7 * 12 * 30]],
-                   cl=ConsistencyLevel.ONE)
+            now = time.time()
+            if now < self.compaction_window_end:
+                waiting_in_sec = self.compaction_window_end - now
+                logger.debug("Waiting {} sec for gc_grace to pass before compaction".format(waiting_in_sec))
+                time.sleep(waiting_in_sec)
 
-        # generate an sstable with an RT that opens in the penultimate block and closes in the last one
-        stmt = session.prepare('DELETE FROM journals.logs WHERE user = ? AND year = ? AND month = ? AND day = ?;')
-        batch = BatchStatement(batch_type=BatchType.UNLOGGED)
-        for day in range(1, 31):
-            batch.add(stmt, ['beobal', 2018, 1, day])
-        session.execute(batch)
-        node1.flush()
+            logger.debug("Compacting.....")
+            node.compact()
+            logger.debug("Compaction injection finished, proceed to ack message post-compaction")
 
-        # the data should still be there for years 2011-2017, but prior to CASSANDRA-14513 it would've been gone
-        assert_all(session,
-                   "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
-                   [[7 * 12 * 30]],
-                   cl=ConsistencyLevel.ONE)
+        def decrementFileCounter(self) :
+            self.__n_file_before_workload-=1
 
-    @since('3.0')
-    def test_14513_permanent(self):
-        """
-        @jira_ticket CASSANDRA-14513
+        def ack_filepath(self, filename) :
+            return os.path.join(self.__ack_dir, filename)
 
-        A reproduction / regression test to illustrate CASSANDRA-14513:
-        permanent data loss when doing reverse-order queries with range
-        tombstones in place.
+        def open_compaction_window(self) :
+            self.compaction_window_start = time.time() + self.gc_grace_seconds
+            logger.debug("Compaction window start at {}".format(self.compaction_window_start))
 
-        This test shows how the invalid RT can propagate to other replicas
-        and delete data permanently.
-        """
-        cluster = self.cluster
+        def close_compaction_window(self) :
+            self.compaction_window_end = time.time() + self.gc_grace_seconds
+            logger.debug("Compaction window end at {}".format(self.compaction_window_end))
 
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        # set column_index_size_in_kb to 1 for a slightly easier reproduction sequence
-        cluster.set_configuration_options(values={'column_index_size_in_kb': 1, 'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
+        def turnOff(self) :
+            self.__observing = False
 
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        def stillObserving(self) :
+            return self.__observing
 
-        session = self.patient_exclusive_cql_connection(node1)
 
-        query = "CREATE KEYSPACE journals WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};"
-        session.execute(query)
+        class Handler(FileSystemEventHandler) :
+            handler_manager = None
 
-        query = 'CREATE TABLE journals.logs (user text, year int, month int, day int, title text, body text, PRIMARY KEY ((user), year, month, day, title));';
-        session.execute(query)
+            @staticmethod
+            def ack_event(event) :
+                manager = TestConsistency.ManagerFor14515.Handler.handler_manager
+                filename = manager.ack_filepath(os.path.basename(event.dest_path))
+                shutil.copyfile(event.dest_path, filename + ".tmp")
+                os.rename(filename + ".tmp", filename)
+                logger.debug("ACK message {}".format(filename))
 
-        # populate the table
-        stmt = session.prepare('INSERT INTO journals.logs (user, year, month, day, title, body) VALUES (?, ?, ?, ?, ?, ?);');
-        for year in range(2011, 2018):
-            for month in range(1, 13):
-                for day in range(1, 31):
-                    session.execute(stmt, ['beobal', year, month, day, 'title', 'Lorem ipsum dolor sit amet'], ConsistencyLevel.QUORUM)
-        cluster.flush()
+            @staticmethod
+            def on_any_event(event) :
+                manager = TestConsistency.ManagerFor14515.Handler.handler_manager
+                ack_event = TestConsistency.ManagerFor14515.Handler.ack_event
+                if event.event_type == watchdog.events.EVENT_TYPE_MOVED :
+                    logger.debug("Captured event {}".format(event))
+                    if manager.stillObserving() :
+                        manager.decrementFileCounter()
+                        if manager.should_inject_compaction() :
+                            manager.inject_compaction()
+                        else :
+                            if time.time() >= manager.compaction_window_start:
+                                logger.error("Found non-injecting read after compaction window start, wait for timeout...")
+                                return
 
-        # make sure the data is there
-        assert_all(session,
-                   "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
-                   [[7 * 12 * 30]],
-                   cl=ConsistencyLevel.QUORUM)
+                    ack_event(event)
+                 
 
-        # take one node down
-        node3.stop(wait_other_notice=True)
-
-        # generate an sstable with an RT that opens in the penultimate block and closes in the last one
-        stmt = session.prepare('DELETE FROM journals.logs WHERE user = ? AND year = ? AND month = ? AND day = ?;')
-        batch = BatchStatement(batch_type=BatchType.UNLOGGED)
-        for day in range(1, 31):
-            batch.add(stmt, ['beobal', 2018, 1, day])
-        session.execute(batch, [], ConsistencyLevel.QUORUM)
-        node1.flush()
-        node2.flush()
-
-        # take node2 down, get node3 up
-        node2.stop(wait_other_notice=True)
-        node3.start()
-
-        # insert an RT somewhere so that we would have a closing marker and RR makes its mutations
-        stmt = SimpleStatement("DELETE FROM journals.logs WHERE user = 'beobal' AND year = 2010 AND month = 12 AND day = 30",
-                               consistency_level=ConsistencyLevel.QUORUM)
-        session.execute(stmt)
-
-        # this read will trigger read repair with the invalid RT and propagate the wide broken RT,
-        # permanently killing the partition
-        stmt = SimpleStatement("SELECT * FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
-                               consistency_level=ConsistencyLevel.QUORUM)
-        session.execute(stmt)
-
-        # everything is gone
-        assert_all(session,
-                   "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal';",
-                   [[7 * 12 * 30]],
-                   cl=ConsistencyLevel.QUORUM)
 
     @since('3.0')
-    def test_14330(self):
-        """
-        @jira_ticket CASSANDRA-14330
+    def test_14515(self):
 
-        A regression test to prove that we no longer trigger
-        AssertionError during read repair in DataResolver
-        when encountering a repeat open RT bound from short
-        read protection responses.
-        """
         cluster = self.cluster
 
         # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+        # increase timeout to allow compaction before SRP
+        cluster.set_configuration_options(values={
+            'hinted_handoff_enabled': False,
+            'read_request_timeout_in_ms': 60000,
+            'range_request_timeout_in_ms' : 60000,
+            'allow_interceptor' : True
+            })
         cluster.set_batch_commitlog(enabled=True)
 
         cluster.populate(2).start()
         node1, node2 = cluster.nodelist()
+        logger.debug(node1)
 
+        manager = TestConsistency.ManagerFor14515([node1, node2])
+        manager.start_service()
         session = self.patient_cql_connection(node2)
 
         query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
         session.execute(query)
 
-        query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
+        manager.gc_grace_seconds = 25
+        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck)) WITH gc_grace_seconds=25";
         session.execute(query)
 
-        # with all nodes up, insert an RT and 2 rows on every node
-        #
-        # node1 | RT[0...] 0 1
-        # node2 | RT[0...] 0 1
+        manager.open_compaction_window()
+        result = session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0;')
+        manager.close_compaction_window()
 
-        session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0;')
         session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 1;')
         session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 1;')
-
-        # with node1 down, delete row 0 on node2
-        #
-        # node1 | RT[0...] 0 1
-        # node2 | RT[0...] x 1
 
         node1.stop(wait_other_notice=True)
         session.execute('DELETE FROM test.test USING TIMESTAMP 1 WHERE pk = 0 AND ck = 0;')
         node1.start(wait_for_binary_proto=True)
 
-        # with both nodes up, make a LIMIT 1 read that would trigger a short read protection
-        # request, which in turn will trigger the AssertionError in DataResolver (prior to
-        # CASSANDRA-14330 fix)
-
+        # Bug trigger
         assert_all(session,
                    'SELECT ck FROM test.test WHERE pk = 0 LIMIT 1;',
                    [[1]],
-                   cl=ConsistencyLevel.ALL)
-
-    @since('3.0')
-    def test_13911(self):
-        """
-        @jira_ticket CASSANDRA-13911
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
-        session.execute(query)
-
-        # with node2 down, insert row 0 on node1
-        #
-        # node1, partition 0 | 0
-        # node2, partition 0 |
-
-        node2.stop(wait_other_notice=True)
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0);')
-        node2.start(wait_for_binary_proto=True)
-
-        # with node1 down, delete row 1 and 2 on node2
-        #
-        # node1, partition 0 | 0
-        # node2, partition 0 |   x x
-
-        session = self.patient_cql_connection(node2)
-
-        node1.stop(wait_other_notice=True)
-        session.execute('DELETE FROM test.test WHERE pk = 0 AND ck IN (1, 2);')
-        node1.start(wait_for_binary_proto=True)
-
-        # with both nodes up, do a CL.ALL query with per partition limit of 1;
-        # prior to CASSANDRA-13911 this would trigger an IllegalStateException
-        assert_all(session,
-                   'SELECT DISTINCT pk FROM test.test;',
-                   [[0]],
-                   cl=ConsistencyLevel.ALL)
-
-    @since('3.11')
-    def test_13911_rows_srp(self):
-        """
-        @jira_ticket CASSANDRA-13911
-
-        A regression test to prove that we can no longer rely on
-        !singleResultCounter.isDoneForPartition() to abort single
-        partition SRP early if a per partition limit is set.
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
-        session.execute(query)
-
-        # with node2 down
-        #
-        # node1, partition 0 | 0 1 - -
-        # node1, partition 2 | 0 x - -
-
-        node2.stop(wait_other_notice=True)
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 0) USING TIMESTAMP 42;')
-        session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck = 1;')
-        node2.start(wait_for_binary_proto=True)
-
-        # with node1 down
-        #
-        # node2, partition 0 | - - 2 3
-        # node2, partition 2 | x 1 2 -
-
-        session = self.patient_cql_connection(node2)
-
-        node1.stop(wait_other_notice=True)
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 2) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 3) USING TIMESTAMP 42;')
-        session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck = 0;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 1) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 2) USING TIMESTAMP 42;')
-        node1.start(wait_for_binary_proto=True)
-
-        # with both nodes up, do a CL.ALL query with per partition limit of 2 and limit of 3;
-        # without the change to if (!singleResultCounter.isDoneForPartition()) branch,
-        # the query would skip SRP on node2, partition 2, and incorrectly return just
-        # [[0, 0], [0, 1]]
-        assert_all(session,
-                   'SELECT pk, ck FROM test.test PER PARTITION LIMIT 2 LIMIT 3;',
-                   [[0, 0], [0, 1],
-                    [2, 2]],
-                   cl=ConsistencyLevel.ALL)
-
-    @since('3.11')
-    def test_13911_partitions_srp(self):
-        """
-        @jira_ticket CASSANDRA-13911
-
-        A regression test to prove that we can't rely on
-        !singleResultCounter.isDone() to abort ranged
-        partition SRP early if a per partition limit is set.
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
-        session.execute(query)
-
-        # with node2 down
-        #
-        # node1, partition 0 | 0 1 - -
-        # node1, partition 2 | x x - -
-
-        node2.stop(wait_other_notice=True)
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 42;')
-        session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck IN  (0, 1);')
-        node2.start(wait_for_binary_proto=True)
-
-        # with node1 down
-        #
-        # node2, partition 0 | - - 2 3
-        # node2, partition 2 | 0 1 - -
-        # node2, partition 4 | 0 1 - -
-
-        session = self.patient_cql_connection(node2)
-
-        node1.stop(wait_other_notice=True)
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 2) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 3) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 0) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 1) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (4, 0) USING TIMESTAMP 42;')
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (4, 1) USING TIMESTAMP 42;')
-        node1.start(wait_for_binary_proto=True)
-
-        # with both nodes up, do a CL.ALL query with per partition limit of 2 and limit of 4;
-        # without the extra condition in if (!singleResultCounter.isDone()) branch,
-        # the query would skip partitions SRP on node2 at the end of partition 2,
-        # and incorrectly return just [[0, 0], [0, 1]]
-        assert_all(session,
-                   'SELECT pk, ck FROM test.test PER PARTITION LIMIT 2 LIMIT 4;',
-                   [[0, 0], [0, 1],
-                    [4, 0], [4, 1]],
-                   cl=ConsistencyLevel.ALL)
-
-    @since('3.0')
-    def test_13880(self):
-        """
-        @jira_ticket CASSANDRA-13880
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = "CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);"
-        session.execute(query)
-
-        stmt = SimpleStatement("INSERT INTO test.test (id) VALUES (0);",
-                               consistency_level=ConsistencyLevel.ALL)
-        session.execute(stmt)
-
-        # with node2 down and hints disabled, delete the partition on node1
-        node2.stop(wait_other_notice=True)
-        session.execute("DELETE FROM test.test WHERE id = 0;")
-        node2.start()
-
-        # with both nodes up, do a CL.ALL query with per partition limit of 1;
-        # prior to CASSANDRA-13880 this would cause short read protection to loop forever
-        assert_none(session, "SELECT DISTINCT id FROM test.test WHERE id = 0;", cl=ConsistencyLevel.ALL)
-
-    @since('3.0')
-    def test_13747(self):
-        """
-        @jira_ticket CASSANDRA-13747
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = "CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);"
-        session.execute(query)
-
-        #
-        # populate the table with 10 rows:
-        #
-
-        # -7509452495886106294 |  5
-        # -4069959284402364209 |  1 x
-        # -3799847372828181882 |  8
-        # -3485513579396041028 |  0 x
-        # -3248873570005575792 |  2
-        # -2729420104000364805 |  4 x
-        #  1634052884888577606 |  7
-        #  2705480034054113608 |  6 x
-        #  3728482343045213994 |  9
-        #  9010454139840013625 |  3 x
-
-        stmt = session.prepare("INSERT INTO test.test (id) VALUES (?);")
-        for id in range(0, 10):
-            session.execute(stmt, [id], ConsistencyLevel.ALL)
-
-        # with node2 down and hints disabled, delete every other row on node1
-        node2.stop(wait_other_notice=True)
-        session.execute("DELETE FROM test.test WHERE id IN (1, 0, 4, 6, 3);")
-
-        # with both nodes up, do a DISTINCT range query with CL.ALL;
-        # prior to CASSANDRA-13747 this would cause an assertion in short read protection code
-        node2.start()
-        stmt = SimpleStatement("SELECT DISTINCT token(id), id FROM test.test;",
-                               consistency_level=ConsistencyLevel.ALL)
-        result = list(session.execute(stmt))
-        assert_length_equal(result, 5)
-
-    @since('3.0')
-    def test_13595(self):
-        """
-        @jira_ticket CASSANDRA-13595
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2)
-        node1, node2 = cluster.nodelist()
-        cluster.start()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = 'CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);'
-        session.execute(query)
-
-        # populate the table with 10 partitions,
-        # then delete a bunch of them on different nodes
-        # until we get the following pattern:
-
-        #                token | k | 1 | 2 |
-        # -7509452495886106294 | 5 | n | y |
-        # -4069959284402364209 | 1 | y | n |
-        # -3799847372828181882 | 8 | n | y |
-        # -3485513579396041028 | 0 | y | n |
-        # -3248873570005575792 | 2 | n | y |
-        # -2729420104000364805 | 4 | y | n |
-        #  1634052884888577606 | 7 | n | y |
-        #  2705480034054113608 | 6 | y | n |
-        #  3728482343045213994 | 9 | n | y |
-        #  9010454139840013625 | 3 | y | y |
-
-        stmt = session.prepare('INSERT INTO test.test (id) VALUES (?);')
-        for id in range(0, 10):
-            session.execute(stmt, [id], ConsistencyLevel.ALL)
-
-        # delete every other partition on node1 while node2 is down
-        node2.stop(wait_other_notice=True)
-        session.execute('DELETE FROM test.test WHERE id IN (5, 8, 2, 7, 9);')
-        node2.start(wait_for_binary_proto=True)
-
-        session = self.patient_cql_connection(node2)
-
-        # delete every other alternate partition on node2 while node1 is down
-        node1.stop(wait_other_notice=True)
-        session.execute('DELETE FROM test.test WHERE id IN (1, 0, 4, 6);')
-        node1.start(wait_for_binary_proto=True)
-
-        session = self.patient_exclusive_cql_connection(node1)
-
-        # until #13595 the query would incorrectly return [1]
-        assert_all(session,
-                   'SELECT id FROM test.test LIMIT 1;',
-                   [[3]],
-                   cl=ConsistencyLevel.ALL)
-
-    @since('3.0')
-    def test_12872(self):
-        """
-        @jira_ticket CASSANDRA-12872
-        """
-        cluster = self.cluster
-
-        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-
-        query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
-        session.execute(query)
-
-        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));"
-        session.execute(query)
-
-        stmt = session.prepare("INSERT INTO test.test (pk, ck) VALUES (0, ?);")
-        for ck in range(0, 4):
-            session.execute(stmt, [ck], ConsistencyLevel.ALL)
-
-        # node1 |   up | 0 1 2 3
-        # node2 |   up | 0 1 2 3
-
-        node2.stop(wait_other_notice=True)
-
-        # node1 |   up | 0 1 2 3
-        # node2 | down | 0 1 2 3
-
-        session.execute('DELETE FROM test.test WHERE pk = 0 AND ck IN (1, 2, 3);')
-
-        # node1 |   up | 0 x x x
-        # node2 | down | 0 1 2 3
-
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 5);')
-
-        # node1 |   up | 0 x x x   5
-        # node2 | down | 0 1 2 3
-
-        node2.start()
-        node1.stop(wait_other_notice=True)
-
-        # node1 | down | 0 x x x   5
-        # node2 |   up | 0 1 2 3
-
-        session = self.patient_cql_connection(node2)
-
-        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 4);')
-
-        # node1 | down | 0 x x x   5
-        # node2 |   up | 0 1 2 3 4
-
-        node1.start()
-
-        # node1 |   up | 0 x x x   5
-        # node2 |   up | 0 1 2 3 4
-
-        assert_all(session,
-                   'SELECT ck FROM test.test WHERE pk = 0 LIMIT 2;',
-                   [[0], [4]],
-                   cl=ConsistencyLevel.ALL)
-
-    def test_short_read(self):
-        """
-        @jira_ticket CASSANDRA-9460
-        """
-        cluster = self.cluster
-
-        # This test causes the python driver to be extremely noisy due to
-        # frequent starting and stopping of nodes. Let's move the log level
-        # of the driver to ERROR for this test only
-        logging.getLogger("cassandra").setLevel('ERROR')
-
-        # Disable hinted handoff and set batch commit log so this doesn't
-        # interfer with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-        create_ks(session, 'ks', 3)
-
-        if cluster.version() < '4.0':
-            create_cf(session, 'cf', read_repair=0.0)
-        else:
-            create_cf(session, 'cf')
-
-        normal_key = 'normal'
-        reversed_key = 'reversed'
-
-        # insert 9 columns in two rows
-        insert_columns(self, session, normal_key, 9)
-        insert_columns(self, session, reversed_key, 9)
-
-        # Delete 3 first columns (and 3 last columns, for the reversed version) with a different node dead each time
-        for node, column_number_to_delete in zip(list(range(1, 4)), list(range(3))):
-            self.stop_node(node)
-            self.delete(node, normal_key, column_number_to_delete)
-            self.delete(node, reversed_key, 8 - column_number_to_delete)
-            self.restart_node(node)
-
-        # Query 3 firsts columns in normal order
-        session = self.patient_cql_connection(node1, 'ks')
-        query = SimpleStatement(
-            'SELECT c, v FROM cf WHERE key=\'k{}\' LIMIT 3'.format(normal_key),
-            consistency_level=ConsistencyLevel.QUORUM)
-        rows = list(session.execute(query))
-        res = rows
-        assert_length_equal(res, 3)
-
-        # value 0, 1 and 2 have been deleted
-        for i in range(1, 4):
-            assert 'value{}'.format(i + 2) == res[i - 1][1]
-
-        # Query 3 firsts columns in reverse order
-        session = self.patient_cql_connection(node1, 'ks')
-        query = SimpleStatement(
-            'SELECT c, v FROM cf WHERE key=\'k{}\' ORDER BY c DESC LIMIT 3'.format(reversed_key),
-            consistency_level=ConsistencyLevel.QUORUM)
-        rows = list(session.execute(query))
-        res = rows
-        assert_length_equal(res, 3)
-
-        # value 6, 7 and 8 have been deleted
-        for i in range(0, 3):
-            assert 'value{}'.format(5 - i) == res[i][1]
-
-        session.execute('TRUNCATE cf')
-
-    def test_short_read_delete(self):
-        """ Test short reads ultimately leaving no columns alive [#4000] """
-        cluster = self.cluster
-
-        # Disable hinted handoff and set batch commit log so this doesn't
-        # interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-        create_ks(session, 'ks', 3)
-        if cluster.version() < '4.0':
-            create_cf(session, 'cf', read_repair=0.0)
-        else:
-            create_cf(session, 'cf')
-
-        # insert 2 columns in one row
-        insert_columns(self, session, 0, 2)
-
-        # Delete the row while first node is dead
-        node1.flush()
-        node1.stop(wait_other_notice=True)
-        session = self.patient_cql_connection(node2, 'ks')
-
-        query = SimpleStatement('DELETE FROM cf WHERE key=\'k0\'', consistency_level=ConsistencyLevel.ONE)
-        session.execute(query)
-
-        node1.start()
-
-        # Query first column
-        session = self.patient_cql_connection(node1, 'ks')
-
-        assert_none(session, "SELECT c, v FROM cf WHERE key=\'k0\' LIMIT 1", cl=ConsistencyLevel.QUORUM)
-
-    def test_short_read_quorum_delete(self):
-        """
-        @jira_ticket CASSANDRA-8933
-        """
-        cluster = self.cluster
-        # Consider however 3 nodes A, B, C (RF=3), and following sequence of operations (all done at QUORUM):
-
-        # Disable hinted handoff and set batch commit log so this doesn't
-        # interfere with the test
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.set_batch_commitlog(enabled=True)
-
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-        create_ks(session, 'ks', 3)
-
-        if cluster.version() < '4.0':
-            session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY(id, v)) WITH read_repair_chance = 0.0")
-        else:
-            session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY(id, v))")
-
-        # we write 1 and 2 in a partition: all nodes get it.
-        session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (0, 1)", consistency_level=ConsistencyLevel.ALL))
-        session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (0, 2)", consistency_level=ConsistencyLevel.ALL))
-
-        # we delete 1: only A and C get it.
-        node2.flush()
-        node2.stop(wait_other_notice=True)
-        session.execute(SimpleStatement("DELETE FROM t WHERE id = 0 AND v = 1", consistency_level=ConsistencyLevel.QUORUM))
-        node2.start()
-
-        # we delete 2: only B and C get it.
-        node1.flush()
-        node1.stop(wait_other_notice=True)
-        session = self.patient_cql_connection(node2, 'ks')
-        session.execute(SimpleStatement("DELETE FROM t WHERE id = 0 AND v = 2", consistency_level=ConsistencyLevel.QUORUM))
-        node1.start()
-        session = self.patient_cql_connection(node1, 'ks')
-
-        # we read the first row in the partition (so with a LIMIT 1) and A and B answer first.
-        node3.flush()
-        node3.stop(wait_other_notice=True)
-        assert_none(session, "SELECT * FROM t WHERE id = 0 LIMIT 1", cl=ConsistencyLevel.QUORUM)
-
-    @ported_to_in_jvm('4.0')
-    def test_readrepair(self):
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-
-        if not self.dtest_config.use_vnodes:
-            cluster.populate(2).start()
-        else:
-            tokens = cluster.balanced_tokens(2)
-            cluster.populate(2, tokens=tokens).start()
-        node1, node2 = cluster.nodelist()
-
-        session = self.patient_cql_connection(node1)
-        create_ks(session, 'ks', 2)
-        if cluster.version() < '4.0':
-            create_c1c2_table(self, session, read_repair=1.0)
-        else:
-            create_c1c2_table(self, session)
-
-        node2.stop(wait_other_notice=True)
-
-        insert_c1c2(session, n=10000, consistency=ConsistencyLevel.ONE)
-
-        node2.start(wait_for_binary_proto=True)
-
-        # query everything to cause RR
-        for n in range(0, 10000):
-            query_c1c2(session, n, ConsistencyLevel.QUORUM)
-
-        node1.stop(wait_other_notice=True)
-
-        # Check node2 for all the keys that should have been repaired
-        session = self.patient_cql_connection(node2, keyspace='ks')
-        for n in range(0, 10000):
-            query_c1c2(session, n, ConsistencyLevel.ONE)
-
-    def test_quorum_available_during_failure(self):
-        cl = ConsistencyLevel.QUORUM
-        rf = 3
-
-        logger.debug("Creating a ring")
-        cluster = self.cluster
-        if not self.dtest_config.use_vnodes:
-            cluster.populate(3).start()
-        else:
-            tokens = cluster.balanced_tokens(3)
-            cluster.populate(3, tokens=tokens).start()
-        node1, node2, node3 = cluster.nodelist()
-
-        logger.debug("Set to talk to node 2")
-        session = self.patient_cql_connection(node2)
-        create_ks(session, 'ks', rf)
-        create_c1c2_table(self, session)
-
-        logger.debug("Generating some data")
-        insert_c1c2(session, n=100, consistency=cl)
-
-        logger.debug("Taking down node1")
-        node1.stop(wait_other_notice=True)
-
-        logger.debug("Reading back data.")
-        for n in range(100):
-            query_c1c2(session, n, cl)
-
-    def stop_node(self, node_number):
-        to_stop = self.cluster.nodes["node%d" % node_number]
-        to_stop.flush()
-        to_stop.stop(wait_other_notice=True)
-
-    def delete(self, stopped_node_number, key, column):
-        next_node = self.cluster.nodes["node%d" % (((stopped_node_number + 1) % 3) + 1)]
-        session = self.patient_cql_connection(next_node, 'ks')
-
-        # delete data for normal key
-        query = 'BEGIN BATCH '
-        query = query + 'DELETE FROM cf WHERE key=\'k%s\' AND c=\'c%06d\'; ' % (key, column)
-        query = query + 'DELETE FROM cf WHERE key=\'k%s\' AND c=\'c2\'; ' % (key,)
-        query = query + 'APPLY BATCH;'
-        simple_query = SimpleStatement(query, consistency_level=ConsistencyLevel.QUORUM)
-        session.execute(simple_query)
-
-    def restart_node(self, node_number):
-        stopped_node = self.cluster.nodes["node%d" % node_number]
-        stopped_node.start(wait_for_binary_proto=True)
+                   cl=ConsistencyLevel.ALL,
+                   timeout=60)
+
+    # @since('3.0')
+    # def test_14513_transient(self):
+    #     """
+    #     @jira_ticket CASSANDRA-14513
+
+    #     A reproduction / regression test to illustrate CASSANDRA-14513:
+    #     transient data loss when doing reverse-order queries with range
+    #     tombstones in place.
+
+    #     This test shows how the bug can cause queries to return invalid
+    #     results by just a single node.
+    #     """
+    #     cluster = self.cluster
+
+    #     # set column_index_size_in_kb to 1 for a slightly easier reproduction sequence
+    #     cluster.set_configuration_options(values={'column_index_size_in_kb': 1})
+
+    #     cluster.populate(1).start()
+    #     node1 = cluster.nodelist()[0]
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE journals WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 1};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE journals.logs (user text, year int, month int, day int, title text, body text, PRIMARY KEY ((user), year, month, day, title));';
+    #     session.execute(query)
+
+    #     # populate the table
+    #     stmt = session.prepare('INSERT INTO journals.logs (user, year, month, day, title, body) VALUES (?, ?, ?, ?, ?, ?);');
+    #     for year in range(2011, 2018):
+    #         for month in range(1, 13):
+    #             for day in range(1, 31):
+    #                 session.execute(stmt, ['beobal', year, month, day, 'title', 'Lorem ipsum dolor sit amet'], ConsistencyLevel.ONE)
+    #     node1.flush()
+
+    #     # make sure the data is there
+    #     assert_all(session,
+    #                "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
+    #                [[7 * 12 * 30]],
+    #                cl=ConsistencyLevel.ONE)
+
+    #     # generate an sstable with an RT that opens in the penultimate block and closes in the last one
+    #     stmt = session.prepare('DELETE FROM journals.logs WHERE user = ? AND year = ? AND month = ? AND day = ?;')
+    #     batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+    #     for day in range(1, 31):
+    #         batch.add(stmt, ['beobal', 2018, 1, day])
+    #     session.execute(batch)
+    #     node1.flush()
+
+    #     # the data should still be there for years 2011-2017, but prior to CASSANDRA-14513 it would've been gone
+    #     assert_all(session,
+    #                "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
+    #                [[7 * 12 * 30]],
+    #                cl=ConsistencyLevel.ONE)
+
+    # @since('3.0')
+    # def test_14513_permanent(self):
+    #     """
+    #     @jira_ticket CASSANDRA-14513
+
+    #     A reproduction / regression test to illustrate CASSANDRA-14513:
+    #     permanent data loss when doing reverse-order queries with range
+    #     tombstones in place.
+
+    #     This test shows how the invalid RT can propagate to other replicas
+    #     and delete data permanently.
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     # set column_index_size_in_kb to 1 for a slightly easier reproduction sequence
+    #     cluster.set_configuration_options(values={'column_index_size_in_kb': 1, 'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(3).start()
+    #     node1, node2, node3 = cluster.nodelist()
+
+    #     session = self.patient_exclusive_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE journals WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE journals.logs (user text, year int, month int, day int, title text, body text, PRIMARY KEY ((user), year, month, day, title));';
+    #     session.execute(query)
+
+    #     # populate the table
+    #     stmt = session.prepare('INSERT INTO journals.logs (user, year, month, day, title, body) VALUES (?, ?, ?, ?, ?, ?);');
+    #     for year in range(2011, 2018):
+    #         for month in range(1, 13):
+    #             for day in range(1, 31):
+    #                 session.execute(stmt, ['beobal', year, month, day, 'title', 'Lorem ipsum dolor sit amet'], ConsistencyLevel.QUORUM)
+    #     cluster.flush()
+
+    #     # make sure the data is there
+    #     assert_all(session,
+    #                "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
+    #                [[7 * 12 * 30]],
+    #                cl=ConsistencyLevel.QUORUM)
+
+    #     # take one node down
+    #     node3.stop(wait_other_notice=True)
+
+    #     # generate an sstable with an RT that opens in the penultimate block and closes in the last one
+    #     stmt = session.prepare('DELETE FROM journals.logs WHERE user = ? AND year = ? AND month = ? AND day = ?;')
+    #     batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+    #     for day in range(1, 31):
+    #         batch.add(stmt, ['beobal', 2018, 1, day])
+    #     session.execute(batch, [], ConsistencyLevel.QUORUM)
+    #     node1.flush()
+    #     node2.flush()
+
+    #     # take node2 down, get node3 up
+    #     node2.stop(wait_other_notice=True)
+    #     node3.start()
+
+    #     # insert an RT somewhere so that we would have a closing marker and RR makes its mutations
+    #     stmt = SimpleStatement("DELETE FROM journals.logs WHERE user = 'beobal' AND year = 2010 AND month = 12 AND day = 30",
+    #                            consistency_level=ConsistencyLevel.QUORUM)
+    #     session.execute(stmt)
+
+    #     # this read will trigger read repair with the invalid RT and propagate the wide broken RT,
+    #     # permanently killing the partition
+    #     stmt = SimpleStatement("SELECT * FROM journals.logs WHERE user = 'beobal' AND year < 2018 ORDER BY year DESC;",
+    #                            consistency_level=ConsistencyLevel.QUORUM)
+    #     session.execute(stmt)
+
+    #     # everything is gone
+    #     assert_all(session,
+    #                "SELECT COUNT(*) FROM journals.logs WHERE user = 'beobal';",
+    #                [[7 * 12 * 30]],
+    #                cl=ConsistencyLevel.QUORUM)
+
+    # @since('3.0')
+    # def test_14330(self):
+    #     """
+    #     @jira_ticket CASSANDRA-14330
+
+    #     A regression test to prove that we no longer trigger
+    #     AssertionError during read repair in DataResolver
+    #     when encountering a repeat open RT bound from short
+    #     read protection responses.
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
+    #     session.execute(query)
+
+    #     # with all nodes up, insert an RT and 2 rows on every node
+    #     #
+    #     # node1 | RT[0...] 0 1
+    #     # node2 | RT[0...] 0 1
+
+    #     session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 1;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 1;')
+
+    #     # with node1 down, delete row 0 on node2
+    #     #
+    #     # node1 | RT[0...] 0 1
+    #     # node2 | RT[0...] x 1
+
+    #     node1.stop(wait_other_notice=True)
+    #     session.execute('DELETE FROM test.test USING TIMESTAMP 1 WHERE pk = 0 AND ck = 0;')
+    #     node1.start(wait_for_binary_proto=True)
+
+    #     # with both nodes up, make a LIMIT 1 read that would trigger a short read protection
+    #     # request, which in turn will trigger the AssertionError in DataResolver (prior to
+    #     # CASSANDRA-14330 fix)
+
+    #     assert_all(session,
+    #                'SELECT ck FROM test.test WHERE pk = 0 LIMIT 1;',
+    #                [[1]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # @since('3.0')
+    # def test_13911(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13911
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
+    #     session.execute(query)
+
+    #     # with node2 down, insert row 0 on node1
+    #     #
+    #     # node1, partition 0 | 0
+    #     # node2, partition 0 |
+
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0);')
+    #     node2.start(wait_for_binary_proto=True)
+
+    #     # with node1 down, delete row 1 and 2 on node2
+    #     #
+    #     # node1, partition 0 | 0
+    #     # node2, partition 0 |   x x
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     node1.stop(wait_other_notice=True)
+    #     session.execute('DELETE FROM test.test WHERE pk = 0 AND ck IN (1, 2);')
+    #     node1.start(wait_for_binary_proto=True)
+
+    #     # with both nodes up, do a CL.ALL query with per partition limit of 1;
+    #     # prior to CASSANDRA-13911 this would trigger an IllegalStateException
+    #     assert_all(session,
+    #                'SELECT DISTINCT pk FROM test.test;',
+    #                [[0]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # @since('3.11')
+    # def test_13911_rows_srp(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13911
+
+    #     A regression test to prove that we can no longer rely on
+    #     !singleResultCounter.isDoneForPartition() to abort single
+    #     partition SRP early if a per partition limit is set.
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
+    #     session.execute(query)
+
+    #     # with node2 down
+    #     #
+    #     # node1, partition 0 | 0 1 - -
+    #     # node1, partition 2 | 0 x - -
+
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 0) USING TIMESTAMP 42;')
+    #     session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck = 1;')
+    #     node2.start(wait_for_binary_proto=True)
+
+    #     # with node1 down
+    #     #
+    #     # node2, partition 0 | - - 2 3
+    #     # node2, partition 2 | x 1 2 -
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     node1.stop(wait_other_notice=True)
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 2) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 3) USING TIMESTAMP 42;')
+    #     session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck = 0;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 1) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 2) USING TIMESTAMP 42;')
+    #     node1.start(wait_for_binary_proto=True)
+
+    #     # with both nodes up, do a CL.ALL query with per partition limit of 2 and limit of 3;
+    #     # without the change to if (!singleResultCounter.isDoneForPartition()) branch,
+    #     # the query would skip SRP on node2, partition 2, and incorrectly return just
+    #     # [[0, 0], [0, 1]]
+    #     assert_all(session,
+    #                'SELECT pk, ck FROM test.test PER PARTITION LIMIT 2 LIMIT 3;',
+    #                [[0, 0], [0, 1],
+    #                 [2, 2]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # @since('3.11')
+    # def test_13911_partitions_srp(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13911
+
+    #     A regression test to prove that we can't rely on
+    #     !singleResultCounter.isDone() to abort ranged
+    #     partition SRP early if a per partition limit is set.
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));'
+    #     session.execute(query)
+
+    #     # with node2 down
+    #     #
+    #     # node1, partition 0 | 0 1 - -
+    #     # node1, partition 2 | x x - -
+
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 1) USING TIMESTAMP 42;')
+    #     session.execute('DELETE FROM test.test USING TIMESTAMP 42 WHERE pk = 2 AND ck IN  (0, 1);')
+    #     node2.start(wait_for_binary_proto=True)
+
+    #     # with node1 down
+    #     #
+    #     # node2, partition 0 | - - 2 3
+    #     # node2, partition 2 | 0 1 - -
+    #     # node2, partition 4 | 0 1 - -
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     node1.stop(wait_other_notice=True)
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 2) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 3) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 0) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 1) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (4, 0) USING TIMESTAMP 42;')
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (4, 1) USING TIMESTAMP 42;')
+    #     node1.start(wait_for_binary_proto=True)
+
+    #     # with both nodes up, do a CL.ALL query with per partition limit of 2 and limit of 4;
+    #     # without the extra condition in if (!singleResultCounter.isDone()) branch,
+    #     # the query would skip partitions SRP on node2 at the end of partition 2,
+    #     # and incorrectly return just [[0, 0], [0, 1]]
+    #     assert_all(session,
+    #                'SELECT pk, ck FROM test.test PER PARTITION LIMIT 2 LIMIT 4;',
+    #                [[0, 0], [0, 1],
+    #                 [4, 0], [4, 1]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # @since('3.0')
+    # def test_13880(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13880
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = "CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);"
+    #     session.execute(query)
+
+    #     stmt = SimpleStatement("INSERT INTO test.test (id) VALUES (0);",
+    #                            consistency_level=ConsistencyLevel.ALL)
+    #     session.execute(stmt)
+
+    #     # with node2 down and hints disabled, delete the partition on node1
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute("DELETE FROM test.test WHERE id = 0;")
+    #     node2.start()
+
+    #     # with both nodes up, do a CL.ALL query with per partition limit of 1;
+    #     # prior to CASSANDRA-13880 this would cause short read protection to loop forever
+    #     assert_none(session, "SELECT DISTINCT id FROM test.test WHERE id = 0;", cl=ConsistencyLevel.ALL)
+
+    # @since('3.0')
+    # def test_13747(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13747
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = "CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);"
+    #     session.execute(query)
+
+    #     #
+    #     # populate the table with 10 rows:
+    #     #
+
+    #     # -7509452495886106294 |  5
+    #     # -4069959284402364209 |  1 x
+    #     # -3799847372828181882 |  8
+    #     # -3485513579396041028 |  0 x
+    #     # -3248873570005575792 |  2
+    #     # -2729420104000364805 |  4 x
+    #     #  1634052884888577606 |  7
+    #     #  2705480034054113608 |  6 x
+    #     #  3728482343045213994 |  9
+    #     #  9010454139840013625 |  3 x
+
+    #     stmt = session.prepare("INSERT INTO test.test (id) VALUES (?);")
+    #     for id in range(0, 10):
+    #         session.execute(stmt, [id], ConsistencyLevel.ALL)
+
+    #     # with node2 down and hints disabled, delete every other row on node1
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute("DELETE FROM test.test WHERE id IN (1, 0, 4, 6, 3);")
+
+    #     # with both nodes up, do a DISTINCT range query with CL.ALL;
+    #     # prior to CASSANDRA-13747 this would cause an assertion in short read protection code
+    #     node2.start()
+    #     stmt = SimpleStatement("SELECT DISTINCT token(id), id FROM test.test;",
+    #                            consistency_level=ConsistencyLevel.ALL)
+    #     result = list(session.execute(stmt))
+    #     assert_length_equal(result, 5)
+
+    # @since('3.0')
+    # def test_13595(self):
+    #     """
+    #     @jira_ticket CASSANDRA-13595
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2)
+    #     node1, node2 = cluster.nodelist()
+    #     cluster.start()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = 'CREATE TABLE IF NOT EXISTS test.test (id int PRIMARY KEY);'
+    #     session.execute(query)
+
+    #     # populate the table with 10 partitions,
+    #     # then delete a bunch of them on different nodes
+    #     # until we get the following pattern:
+
+    #     #                token | k | 1 | 2 |
+    #     # -7509452495886106294 | 5 | n | y |
+    #     # -4069959284402364209 | 1 | y | n |
+    #     # -3799847372828181882 | 8 | n | y |
+    #     # -3485513579396041028 | 0 | y | n |
+    #     # -3248873570005575792 | 2 | n | y |
+    #     # -2729420104000364805 | 4 | y | n |
+    #     #  1634052884888577606 | 7 | n | y |
+    #     #  2705480034054113608 | 6 | y | n |
+    #     #  3728482343045213994 | 9 | n | y |
+    #     #  9010454139840013625 | 3 | y | y |
+
+    #     stmt = session.prepare('INSERT INTO test.test (id) VALUES (?);')
+    #     for id in range(0, 10):
+    #         session.execute(stmt, [id], ConsistencyLevel.ALL)
+
+    #     # delete every other partition on node1 while node2 is down
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute('DELETE FROM test.test WHERE id IN (5, 8, 2, 7, 9);')
+    #     node2.start(wait_for_binary_proto=True)
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     # delete every other alternate partition on node2 while node1 is down
+    #     node1.stop(wait_other_notice=True)
+    #     session.execute('DELETE FROM test.test WHERE id IN (1, 0, 4, 6);')
+    #     node1.start(wait_for_binary_proto=True)
+
+    #     session = self.patient_exclusive_cql_connection(node1)
+
+    #     # until #13595 the query would incorrectly return [1]
+    #     assert_all(session,
+    #                'SELECT id FROM test.test LIMIT 1;',
+    #                [[3]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # @since('3.0')
+    # def test_12872(self):
+    #     """
+    #     @jira_ticket CASSANDRA-12872
+    #     """
+    #     cluster = self.cluster
+
+    #     # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+
+    #     query = "CREATE KEYSPACE IF NOT EXISTS test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+    #     session.execute(query)
+
+    #     query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck));"
+    #     session.execute(query)
+
+    #     stmt = session.prepare("INSERT INTO test.test (pk, ck) VALUES (0, ?);")
+    #     for ck in range(0, 4):
+    #         session.execute(stmt, [ck], ConsistencyLevel.ALL)
+
+    #     # node1 |   up | 0 1 2 3
+    #     # node2 |   up | 0 1 2 3
+
+    #     node2.stop(wait_other_notice=True)
+
+    #     # node1 |   up | 0 1 2 3
+    #     # node2 | down | 0 1 2 3
+
+    #     session.execute('DELETE FROM test.test WHERE pk = 0 AND ck IN (1, 2, 3);')
+
+    #     # node1 |   up | 0 x x x
+    #     # node2 | down | 0 1 2 3
+
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 5);')
+
+    #     # node1 |   up | 0 x x x   5
+    #     # node2 | down | 0 1 2 3
+
+    #     node2.start()
+    #     node1.stop(wait_other_notice=True)
+
+    #     # node1 | down | 0 x x x   5
+    #     # node2 |   up | 0 1 2 3
+
+    #     session = self.patient_cql_connection(node2)
+
+    #     session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 4);')
+
+    #     # node1 | down | 0 x x x   5
+    #     # node2 |   up | 0 1 2 3 4
+
+    #     node1.start()
+
+    #     # node1 |   up | 0 x x x   5
+    #     # node2 |   up | 0 1 2 3 4
+
+    #     assert_all(session,
+    #                'SELECT ck FROM test.test WHERE pk = 0 LIMIT 2;',
+    #                [[0], [4]],
+    #                cl=ConsistencyLevel.ALL)
+
+    # def test_short_read(self):
+    #     """
+    #     @jira_ticket CASSANDRA-9460
+    #     """
+    #     cluster = self.cluster
+
+    #     # This test causes the python driver to be extremely noisy due to
+    #     # frequent starting and stopping of nodes. Let's move the log level
+    #     # of the driver to ERROR for this test only
+    #     logging.getLogger("cassandra").setLevel('ERROR')
+
+    #     # Disable hinted handoff and set batch commit log so this doesn't
+    #     # interfer with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(3).start()
+    #     node1, node2, node3 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+    #     create_ks(session, 'ks', 3)
+
+    #     if cluster.version() < '4.0':
+    #         create_cf(session, 'cf', read_repair=0.0)
+    #     else:
+    #         create_cf(session, 'cf')
+
+    #     normal_key = 'normal'
+    #     reversed_key = 'reversed'
+
+    #     # insert 9 columns in two rows
+    #     insert_columns(self, session, normal_key, 9)
+    #     insert_columns(self, session, reversed_key, 9)
+
+    #     # Delete 3 first columns (and 3 last columns, for the reversed version) with a different node dead each time
+    #     for node, column_number_to_delete in zip(list(range(1, 4)), list(range(3))):
+    #         self.stop_node(node)
+    #         self.delete(node, normal_key, column_number_to_delete)
+    #         self.delete(node, reversed_key, 8 - column_number_to_delete)
+    #         self.restart_node(node)
+
+    #     # Query 3 firsts columns in normal order
+    #     session = self.patient_cql_connection(node1, 'ks')
+    #     query = SimpleStatement(
+    #         'SELECT c, v FROM cf WHERE key=\'k{}\' LIMIT 3'.format(normal_key),
+    #         consistency_level=ConsistencyLevel.QUORUM)
+    #     rows = list(session.execute(query))
+    #     res = rows
+    #     assert_length_equal(res, 3)
+
+    #     # value 0, 1 and 2 have been deleted
+    #     for i in range(1, 4):
+    #         assert 'value{}'.format(i + 2) == res[i - 1][1]
+
+    #     # Query 3 firsts columns in reverse order
+    #     session = self.patient_cql_connection(node1, 'ks')
+    #     query = SimpleStatement(
+    #         'SELECT c, v FROM cf WHERE key=\'k{}\' ORDER BY c DESC LIMIT 3'.format(reversed_key),
+    #         consistency_level=ConsistencyLevel.QUORUM)
+    #     rows = list(session.execute(query))
+    #     res = rows
+    #     assert_length_equal(res, 3)
+
+    #     # value 6, 7 and 8 have been deleted
+    #     for i in range(0, 3):
+    #         assert 'value{}'.format(5 - i) == res[i][1]
+
+    #     session.execute('TRUNCATE cf')
+
+    # def test_short_read_delete(self):
+    #     """ Test short reads ultimately leaving no columns alive [#4000] """
+    #     cluster = self.cluster
+
+    #     # Disable hinted handoff and set batch commit log so this doesn't
+    #     # interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(2).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+    #     create_ks(session, 'ks', 3)
+    #     if cluster.version() < '4.0':
+    #         create_cf(session, 'cf', read_repair=0.0)
+    #     else:
+    #         create_cf(session, 'cf')
+
+    #     # insert 2 columns in one row
+    #     insert_columns(self, session, 0, 2)
+
+    #     # Delete the row while first node is dead
+    #     node1.flush()
+    #     node1.stop(wait_other_notice=True)
+    #     session = self.patient_cql_connection(node2, 'ks')
+
+    #     query = SimpleStatement('DELETE FROM cf WHERE key=\'k0\'', consistency_level=ConsistencyLevel.ONE)
+    #     session.execute(query)
+
+    #     node1.start()
+
+    #     # Query first column
+    #     session = self.patient_cql_connection(node1, 'ks')
+
+    #     assert_none(session, "SELECT c, v FROM cf WHERE key=\'k0\' LIMIT 1", cl=ConsistencyLevel.QUORUM)
+
+    # def test_short_read_quorum_delete(self):
+    #     """
+    #     @jira_ticket CASSANDRA-8933
+    #     """
+    #     cluster = self.cluster
+    #     # Consider however 3 nodes A, B, C (RF=3), and following sequence of operations (all done at QUORUM):
+
+    #     # Disable hinted handoff and set batch commit log so this doesn't
+    #     # interfere with the test
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+    #     cluster.set_batch_commitlog(enabled=True)
+
+    #     cluster.populate(3).start()
+    #     node1, node2, node3 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+    #     create_ks(session, 'ks', 3)
+
+    #     if cluster.version() < '4.0':
+    #         session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY(id, v)) WITH read_repair_chance = 0.0")
+    #     else:
+    #         session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY(id, v))")
+
+    #     # we write 1 and 2 in a partition: all nodes get it.
+    #     session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (0, 1)", consistency_level=ConsistencyLevel.ALL))
+    #     session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (0, 2)", consistency_level=ConsistencyLevel.ALL))
+
+    #     # we delete 1: only A and C get it.
+    #     node2.flush()
+    #     node2.stop(wait_other_notice=True)
+    #     session.execute(SimpleStatement("DELETE FROM t WHERE id = 0 AND v = 1", consistency_level=ConsistencyLevel.QUORUM))
+    #     node2.start()
+
+    #     # we delete 2: only B and C get it.
+    #     node1.flush()
+    #     node1.stop(wait_other_notice=True)
+    #     session = self.patient_cql_connection(node2, 'ks')
+    #     session.execute(SimpleStatement("DELETE FROM t WHERE id = 0 AND v = 2", consistency_level=ConsistencyLevel.QUORUM))
+    #     node1.start()
+    #     session = self.patient_cql_connection(node1, 'ks')
+
+    #     # we read the first row in the partition (so with a LIMIT 1) and A and B answer first.
+    #     node3.flush()
+    #     node3.stop(wait_other_notice=True)
+    #     assert_none(session, "SELECT * FROM t WHERE id = 0 LIMIT 1", cl=ConsistencyLevel.QUORUM)
+
+    # @ported_to_in_jvm('4.0')
+    # def test_readrepair(self):
+    #     cluster = self.cluster
+    #     cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+
+    #     if not self.dtest_config.use_vnodes:
+    #         cluster.populate(2).start()
+    #     else:
+    #         tokens = cluster.balanced_tokens(2)
+    #         cluster.populate(2, tokens=tokens).start()
+    #     node1, node2 = cluster.nodelist()
+
+    #     session = self.patient_cql_connection(node1)
+    #     create_ks(session, 'ks', 2)
+    #     if cluster.version() < '4.0':
+    #         create_c1c2_table(self, session, read_repair=1.0)
+    #     else:
+    #         create_c1c2_table(self, session)
+
+    #     node2.stop(wait_other_notice=True)
+
+    #     insert_c1c2(session, n=10000, consistency=ConsistencyLevel.ONE)
+
+    #     node2.start(wait_for_binary_proto=True)
+
+    #     # query everything to cause RR
+    #     for n in range(0, 10000):
+    #         query_c1c2(session, n, ConsistencyLevel.QUORUM)
+
+    #     node1.stop(wait_other_notice=True)
+
+    #     # Check node2 for all the keys that should have been repaired
+    #     session = self.patient_cql_connection(node2, keyspace='ks')
+    #     for n in range(0, 10000):
+    #         query_c1c2(session, n, ConsistencyLevel.ONE)
+
+    # def test_quorum_available_during_failure(self):
+    #     cl = ConsistencyLevel.QUORUM
+    #     rf = 3
+
+    #     logger.debug("Creating a ring")
+    #     cluster = self.cluster
+    #     if not self.dtest_config.use_vnodes:
+    #         cluster.populate(3).start()
+    #     else:
+    #         tokens = cluster.balanced_tokens(3)
+    #         cluster.populate(3, tokens=tokens).start()
+    #     node1, node2, node3 = cluster.nodelist()
+
+    #     logger.debug("Set to talk to node 2")
+    #     session = self.patient_cql_connection(node2)
+    #     create_ks(session, 'ks', rf)
+    #     create_c1c2_table(self, session)
+
+    #     logger.debug("Generating some data")
+    #     insert_c1c2(session, n=100, consistency=cl)
+
+    #     logger.debug("Taking down node1")
+    #     node1.stop(wait_other_notice=True)
+
+    #     logger.debug("Reading back data.")
+    #     for n in range(100):
+    #         query_c1c2(session, n, cl)
+
+    # def stop_node(self, node_number):
+    #     to_stop = self.cluster.nodes["node%d" % node_number]
+    #     to_stop.flush()
+    #     to_stop.stop(wait_other_notice=True)
+
+    # def delete(self, stopped_node_number, key, column):
+    #     next_node = self.cluster.nodes["node%d" % (((stopped_node_number + 1) % 3) + 1)]
+    #     session = self.patient_cql_connection(next_node, 'ks')
+
+    #     # delete data for normal key
+    #     query = 'BEGIN BATCH '
+    #     query = query + 'DELETE FROM cf WHERE key=\'k%s\' AND c=\'c%06d\'; ' % (key, column)
+    #     query = query + 'DELETE FROM cf WHERE key=\'k%s\' AND c=\'c2\'; ' % (key,)
+    #     query = query + 'APPLY BATCH;'
+    #     simple_query = SimpleStatement(query, consistency_level=ConsistencyLevel.QUORUM)
+    #     session.execute(simple_query)
+
+    # def restart_node(self, node_number):
+    #     stopped_node = self.cluster.nodes["node%d" % node_number]
+    #     stopped_node.start(wait_for_binary_proto=True)
