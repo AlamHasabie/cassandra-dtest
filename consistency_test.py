@@ -808,8 +808,6 @@ class TestConsistency(Tester):
         def should_inject_compaction(self) :
             return self.__n_file_before_workload == 0
 
-        # Instead of injecting compaction, it turns out 
-        # we can just wait for the data to pass its gc_grace
         def inject_compaction(self, node_id=0) :
             node = self.__cluster[node_id]
 
@@ -861,14 +859,14 @@ class TestConsistency(Tester):
                 ack_event = TestConsistency.ManagerFor14515.Handler.ack_event
                 if event.event_type == watchdog.events.EVENT_TYPE_MOVED :
                     logger.debug("Captured event {}".format(event))
-                    # if manager.stillObserving() :
-                    #     manager.decrementFileCounter()
-                    #     if manager.should_inject_compaction() :
-                    #         manager.inject_compaction()
-                    #     else :
-                    #         if time.time() >= manager.compaction_window_start:
-                    #             logger.error("Found non-injecting read after compaction window start, wait for timeout...")
-                    #            return
+                    if manager.stillObserving() :
+                        manager.decrementFileCounter()
+                        if manager.should_inject_compaction() :
+                            manager.inject_compaction()
+                        else :
+                            if time.time() >= manager.compaction_window_start:
+                                logger.error("Found non-injecting read after compaction window start, wait for timeout...")
+                                return
 
                     ack_event(event)
                  
@@ -877,6 +875,7 @@ class TestConsistency(Tester):
     @since('3.0')
     def test_14515(self):
 
+        GC_GRACE_SECONDS = 55
         cluster = self.cluster
 
         # disable hinted handoff and set batch commit log so this doesn't interfere with the test
@@ -899,8 +898,8 @@ class TestConsistency(Tester):
         query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
         session.execute(query)
 
-        manager.gc_grace_seconds = 60
-        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck))";
+        manager.gc_grace_seconds = GC_GRACE_SECONDS
+        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck)) WITH gc_grace_seconds={}".format(GC_GRACE_SECONDS);
         session.execute(query)
 
         # With both nodes up, insert three data
@@ -911,26 +910,28 @@ class TestConsistency(Tester):
         # node 1 : RT-[@0 , 0@0, 1@1, RT-]@0
         # node 2 : 0@0, 1@1
         node2.stop(wait_other_notice=True)
+        manager.open_compaction_window()
         session.execute('DELETE FROM test.test USING TIMESTAMP 0 WHERE pk = 0 AND ck >= 0 AND ck <= 2;')
+        manager.close_compaction_window()
         node2.start(wait_for_binary_proto=True)
 
         # With node 1 down, insert deletion on node 2
-        # and probably insert 3@0
-        # Maybe : insert data 2 on node 2,
+        # and insert 3@0
         # node 1 : RT-[@0 , 1@1, 1@0, RT-]@0
-        # node 2 : 0@0, X
+        # node 2 : 0@0, X, 3@0
 
         session = self.patient_cql_connection(node2)
         node1.stop(wait_other_notice=True)
         session.execute('DELETE FROM test.test USING TIMESTAMP 1 WHERE pk = 0 AND ck = 1;')
+        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 3) USING TIMESTAMP 0;')
         node1.start(wait_for_binary_proto=True)
 
-        # If we still have the bound end, then we will be able to return 2
-        # However, if the bound ends , then 2 will be a part of the bound,
-        # thus it should not be returned post-compaction
+        # If we still have the bound end, then we will be able to return 3
+        # However, if compaction happens , it means we don't close the bound properly
+        # As a result, the open bound is propagated without its closing bound
         assert_all(session,
                    'SELECT ck FROM test.test WHERE pk = 0 LIMIT 1;',
-                   [[1]],
+                   [[3]],
                    cl=ConsistencyLevel.ALL,
                    timeout=60)
 
